@@ -70,6 +70,7 @@ int khz = 38; // 38kHz carrier frequency for the NEC protocol
 #define IR_STATUS_TIMEOUT 5
 
 unsigned int last_ir_job_status = IR_STATUS_NOT_STARTED;
+unsigned int cur_ir_index = 0;
 unsigned long last_ir_sent_time = 999999; //don't wait for first time
 
 decode_results results;  // Somewhere to store the results
@@ -101,6 +102,7 @@ struct Settings {
   int magic;
   int status;
   unsigned int ir_delay; // threshold before sending IR again
+  unsigned int min_ir_size; // threshold before saving IR 
   float low_temp;
   float high_temp;
 };
@@ -114,6 +116,7 @@ void reset_settings() {
     settings.low_temp = 23;
     settings.high_temp = 25;
     settings.ir_delay = 60;
+    settings.min_ir_size = 20;
     EEPROM.put(0, settings);
     EEPROM.commit();
 }
@@ -188,7 +191,7 @@ void dotemp() {
 
 const char *ssid = "esp8266";
 const char *password = "";
-bool autoConnect;
+String HtmlHeader = "<html><head><title>ESP8266</title><style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style></head><body>";
 
 ESP8266WebServer server ( 80 );
 
@@ -268,6 +271,17 @@ void handleWifi() {
 
 }
 
+String macToStr(const uint8_t* mac)
+{
+  String result;
+  for (int i = 0; i < 6; ++i) {
+    result += String(mac[i], 16);
+    if (i < 5)
+    result += ':';
+  }
+  return result;
+}
+
 void setup ( void ) {
   Serial.begin(9600);
   irrecv.enableIRIn();  // Start the receiver
@@ -288,7 +302,7 @@ void setup ( void ) {
   WiFi.mode(WIFI_AP_STA);
   int ret;
 
-  uint8_t timeout = 10; // 10 * 500 ms = 5 sec time out
+  uint8_t timeout = 20; // 20 * 500 ms = 10 sec time out
   while ( ((ret = WiFi.status()) != WL_CONNECTED) && timeout-- ) {
     Serial.print(".");
     delay(500);
@@ -301,9 +315,11 @@ void setup ( void ) {
     Serial.println(WiFi.localIP().toString());
     // not connected ? start AP
   } else {
-    //WiFi.mode(WIFI_AP);
     Serial.println("Configuring access point...");
-    WiFi.softAP("ESP-TESTAP", "");
+    uint8_t  MAC_softAP[6];
+    uint8_t* mac  = WiFi.softAPmacAddress(MAC_softAP);
+    String APName = "ESP-IR-" + macToStr(mac);
+    WiFi.softAP(APName.c_str(), "");
     WiFi.softAPIP();
     Serial.print("AP IP address ");
     Serial.println(WiFi.softAPIP().toString());
@@ -327,11 +343,11 @@ void setup ( void ) {
   });
   server.on("/reset", [](){  
     reset_settings();
-    String webString="<html><body>settings reset";
+    String webString = HtmlHeader + "settings reset";
     server.send(200, "text/html", webString);
   });
   server.on("/start", [](){  
-    String webString="<html><body>";
+    String webString = HtmlHeader;
       if (settings.status & (IR_READY)) {
         webString += F("started");
         settings.status |= STARTED;
@@ -342,12 +358,12 @@ void setup ( void ) {
     server.send(200, "text/html", webString);
   });
   server.on("/stop", [](){  
-    String webString="<html><body>stopped!";
+    String webString = HtmlHeader + "stopped!";
     settings.status &= ~(STARTED);
     server.send(200, "text/html", webString);
   });
   server.on("/save", [](){  
-    String webString="<html><body>settings saved!";
+    String webString = HtmlHeader + "settings saved!";
     EEPROM.put(0, settings);
     EEPROM.commit();
     server.send(200, "text/html", webString);
@@ -364,26 +380,32 @@ void setup ( void ) {
 void loop ( void ) {
   server.handleClient();
   timer.update();
+  if (last_ir_job_status == IR_STATUS_STARTED) {
+    Serial.println ( "handle set IR request" );
+    set_ir(cur_ir_index);
+  }
 }
 
 String printHelp() {
-  String help = "<br><br><b>usage:</b><br> /wifi(?ssid=[ssid](&pass=[pass]))  --  get or set wifi config";
-  help += "<br> /set?(ir_delay=[secs])(&high_temp=[temp])(&low_temp=[temp]) -- set global settings";
-  help += "<br><a href='/get'> /get -- get global settings</a>";
-  help += "<br><a href='/set_ir'> /set_ir -- set IR code</a>";
-  help += "<br><a href='/send_ir'> /send_ir -- send IR code</a>";
-  help += "<br><a href='/temp'> /temp -- get current temperature</a>";
-  help += "<br><a href='/start'> /start-- start auto IR</a>";
-  help += "<br><a href='/stop'> /stop-- start auto IR</a>";
-  help += "<br><a href='/save'> /save-- save settings to EEPROM</a>";
+  String help = "<br><br><b>usage:</b><br><a href='/wifi'> /wifi</a>(?ssid=[ssid](&pass=[pass]))  --  get or set wifi config";
+  help += "<br><br> /set?(ir_delay=[secs])(&high_temp=[temp])(&low_temp=[temp])(&ir_size=[min IR size])  -- set global settings";
+  help += "<br><br><a href='/get'> /get</a> -- get global settings";
+  help += "<br><br><a href='/set_ir'> /set_ir</a> -- set IR code";
+  help += "<br><br><a href='/send_ir'> /send_ir</a> -- send IR code";
+  help += "<br><br><a href='/temp'> /temp</a> -- get current temperature";
+  help += "<br><br><a href='/start'> /start</a> -- start auto IR";
+  help += "<br><br><a href='/stop'> /stop</a> -- start auto IR";
+  help += "<br><br><a href='/save'> /save</a> -- save settings to EEPROM";
   
   return help;
 }
 
 void handleGet() {
-  String message = "<html><head><title>ESP8266 get settings</title><style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style></head><body><br>";
+  String message = HtmlHeader + "<br>";
   message += "ir_delay: ";
   message += settings.ir_delay ;
+  message += "ir_min_size: ";
+  message += settings.min_ir_size;
   message += "</br>high temp: ";
   message += settings.high_temp;
   message += "</br>low temp: ";  
@@ -395,7 +417,11 @@ void handleGet() {
   }
   for (int i=0;i<IR_MODES;i++){
     if (settings.status & 1<<i) {
-      message += "</br>IR " + array_codes[i] +" set";  
+      message += "</br>IR " + array_codes[i] +" set<br>";
+      IRData data;
+      EEPROM.get(sizeof(settings) + (sizeof(data) * i), data);
+      message += dumpCode(data.data, data.size);  
+
     } else {
       message += "</br><p style='color:#FF0000'>IR " + array_codes[i] +" not set</p>";  
     }
@@ -406,7 +432,7 @@ void handleGet() {
 }
 
 void handleIRJob() {
-  String message = "<html><head><title>ESP8266 set settings</title><style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style></head><body>Set IR<br>";
+  String message = HtmlHeader + "Set IR<br>";
   switch(last_ir_job_status) {
     case IR_STATUS_NOT_STARTED:
       message += "no pending IR job";
@@ -440,9 +466,9 @@ void handleIRJob() {
 
 void handleSetIR() {
   Serial.println ( "handleSetIR" );
-  String message = "<html><head><title>ESP8266 set settings</title><style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>";
+  String message = HtmlHeader;
   if (!server.hasArg("idx")) {  
-    message += "</head><body>Set IR<br>";
+    message += "Set IR<br>";
     for (int i=0;i<IR_MODES;i++){
       message += "<a href='/set_ir?idx=";
       message += i;
@@ -453,45 +479,55 @@ void handleSetIR() {
     return;
   }
   int idx = server.arg("idx").toInt();
-  message += "</head><body>waiting for IR transmission, timeout:<span id='mycounter'></span>.<br><a href='/ir_job_status'>status</a>";
+  message += "waiting for IR transmission, timeout:<span id='mycounter'></span>.<br><a href='/ir_job_status'>status</a>";
   message += "<script>i = 20;function onTimer() { document.getElementById('mycounter').innerHTML = i;i--;if (i < 0) {window.location.href = '/ir_job_status';}else {setTimeout(onTimer, 1000);}}; onTimer();</script>";
   server.send ( 200, "text/html", message );
   last_ir_job_status = 0;
-  set_ir(idx);
+  cur_ir_index = idx;
+  last_ir_job_status = IR_STATUS_STARTED;
+  //set_ir(idx);
 }
 
 void handleSendIR() {
-  String message = "<html><head><title>ESP8266 send IR</title><style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style>";
+  String message = HtmlHeader;
   if (!server.hasArg("idx")) {  
-    message += "</head><body>Send IR<br>";
+    message += "Send IR<br>";
     for (int i=0;i<IR_MODES;i++){
       message += "<a href='/send_ir?idx=";
       message += i;
-      message += "'>send " + array_codes[i] + " ir</a><br>";
+      message += "'>send " + array_codes[i] + " ir</a><br><br>";
     }    
     message += "</body></html>";
     server.send ( 200, "text/html", message );
     return;
   }
   int idx = server.arg("idx").toInt();
-  message += "</head><body>IR Sent</body></html>";
+  message += HtmlHeader + "IR Sent</body></html>";
   server.send ( 200, "text/html", message );
   send_ir(idx);
 }
 
 
 void handleSet() {
-  String message = "<html><head><title>ESP8266 set settings</title><style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style></head><body>\setting args:<br>";
+  String message = HtmlHeader + "setting args:<br>";
   String unknown = "";
   bool set = false;
   bool wrong = false;
   for (uint8_t i = 0; i < server.args(); i++) {
+
     if (server.argName(i) == "ir_delay") {
         message += "<br>ir_delay old: ";
         message += settings.ir_delay;
         message += " new: ";
         settings.ir_delay = server.arg(i).toInt();
         message += settings.ir_delay;
+        set = true;
+    } else if (server.argName(i) == "ir_size") {
+        message += "<br>ir_size old: ";
+        message += settings.min_ir_size;
+        message += " new: ";
+        settings.min_ir_size = server.arg(i).toInt();
+        message += settings.min_ir_size;
         set = true;
     } else if (server.argName(i) == "high_temp") {
         message += "<br>high_temp old: ";
@@ -520,23 +556,24 @@ void handleSet() {
   server.send ( 200, "text/html", message );
 }
 
-void  dumpCode (volatile uint16_t* data, int size)
+String dumpCode(volatile uint16_t* data, int size)
 {
   // Start declaration
-  Serial.print("unsigned int  ");          // variable type
-  Serial.print("rawData[");                // array name
-  Serial.print(size - 1, DEC);  // array size
-  Serial.print("] = {");                   // Start declaration
+  String res = "unsigned int  ";          // variable type
+  res += "rawData[";                // array name
+  res += size - 1, DEC;  // array size
+  res += "] = {";                   // Start declaration
 
   // Dump data
   for (int i = 1;  i < size;  i++) {
-    Serial.print(data[i] * USECPERTICK, DEC);
-    if ( i < size-1 ) Serial.print(","); // ',' not needed on last one
-    if (!(i & 1))  Serial.print(" ");
+    res += (data[i] * USECPERTICK);
+    if ( i < size-1 ) res += ","; // ',' not needed on last one
+    if (!(i & 1))  res += " ";
   }
 
   // End declaration
-  Serial.print("};"); 
+  res +=  "};"; 
+  return res;
 }
 
 void send_ir(int idx) {
@@ -547,7 +584,6 @@ void send_ir(int idx) {
 }
 
 int set_ir(int idx) {
-  last_ir_job_status = IR_STATUS_STARTED;
   decode_results  results;
   unsigned long start_time = millis();
   Serial.println(F("waiting for IR signal"));  
@@ -556,25 +592,34 @@ int set_ir(int idx) {
       if(results.overflow) {
         Serial.println(F("IR overflow"));
         last_ir_job_status = IR_STATUS_OVERFLOW;
+        irrecv.resume();
         return IR_STATUS_OVERFLOW;
+      }
+      Serial.println(dumpCode(results.rawbuf, results.rawlen));
+      if(results.rawlen < settings.min_ir_size) {
+        Serial.println(F("IR too small"));
+        irrecv.resume();
+        delay(0);
+        continue;
       }
       IRData data;
       data.size = results.rawlen;
-      memcpy(data.data, (char*)results.rawbuf, (results.rawlen * sizeof(unsigned int)));
+      memcpy(data.data, (char*)results.rawbuf, (results.rawlen * sizeof(uint16_t)));
+      Serial.println((sizeof(settings) + (sizeof(data) * idx)));
       EEPROM.put(sizeof(settings) + (sizeof(data) * idx), data); // store IR in EEPROM
+      delay(0);
       settings.status |= 1 << idx; // set ir status stored
       EEPROM.put(0, settings);
       EEPROM.commit();
-      
-      dumpCode(data.data, data.size);
+      delay(0);
       irrecv.resume();
       Serial.println(F("IR signal stored"));  
       int more = 0;
       while (irrecv.decode(&results)) {  // if more IR coming
-        dumpCode(results.rawbuf, results.rawlen);
+        Serial.println(dumpCode(results.rawbuf, results.rawlen));
         more = 1;
-        irrecv.resume();
         delay(0);
+        irrecv.resume();
       }
       if (more) {
         Serial.println(F("more IR received, undefined behaviour"));
@@ -582,6 +627,7 @@ int set_ir(int idx) {
         return IR_STATUS_MANY;
       }
       last_ir_job_status = IR_STATUS_SUCC;
+      Serial.println(F("return success"));  
       return 0;
     }
     delay(0);
